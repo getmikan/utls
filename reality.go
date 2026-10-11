@@ -125,6 +125,12 @@ type RealityConfig struct {
 	// "mldsa65Verify" value is returned by RealityMldsa65Verify.
 	Mldsa65Seed []byte
 
+	// RequireX25519MLKEM768 makes the server treat a ClientHello as
+	// unauthenticated (and forward it to the target) unless it carries exactly
+	// one X25519MLKEM768 key share placed before an optional X25519 key share,
+	// as Xray does since XTLS/REALITY@8cdf7bf. Off by default for older clients.
+	RequireX25519MLKEM768 bool
+
 	Config
 
 	// postHandshake caches the target's learned post-handshake record
@@ -152,6 +158,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		LimitFallbackUpload:   a.LimitFallbackUpload,
 		LimitFallbackDownload: a.LimitFallbackDownload,
 		Mldsa65Seed:           a.Mldsa65Seed,
+		RequireX25519MLKEM768: a.RequireX25519MLKEM768,
 		Config:                *a.Config.Clone(),
 	}
 	c.postHandshake.Store(a.postHandshakeCache())
@@ -434,20 +441,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
-			var peerPub []byte
-			for _, keyShare := range hs.clientHello.keyShares {
-				if keyShare.group == X25519 && len(keyShare.data) == 32 {
-					peerPub = keyShare.data
-					break
-				}
-			}
-			if peerPub == nil {
-				for _, keyShare := range hs.clientHello.keyShares {
-					if keyShare.group == X25519MLKEM768 && len(keyShare.data) == mlkem.EncapsulationKeySize768+32 {
-						peerPub = keyShare.data[mlkem.EncapsulationKeySize768:]
-						break
-					}
-				}
+			peerPub := realityClientPeerPub(hs.clientHello.keyShares, config.RequireX25519MLKEM768)
+			if peerPub == nil && config.Log != nil {
+				config.Log("REALITY remoteAddr: %v no acceptable key share", remoteAddr)
 			}
 			for peerPub != nil {
 				if hs.AuthKey, err = curve25519.X25519(config.PrivateKey, peerPub); err != nil {
