@@ -70,7 +70,11 @@ func (c *realityMirrorConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-const realitySize uint16 = 16384
+// realitySize bounds the target's first flight buffered by the REALITY
+// server. It is 17 KiB (XTLS/REALITY#33) so that targets sending full-size
+// TLS 1.3 records (up to 2^14+256 bytes of ciphertext) are mirrored instead of
+// being rejected as too long.
+const realitySize uint16 = 17 * 1024
 
 var realityTypes = [7]string{
 	"Server Hello",
