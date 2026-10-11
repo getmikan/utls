@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mldsa"
 	"github.com/metacubex/utls/internal/mlkem"
 	"github.com/metacubex/utls/internal/ratelimit"
 
@@ -117,12 +118,22 @@ type RealityConfig struct {
 	LimitFallbackUpload   RealityLimitFallback
 	LimitFallbackDownload RealityLimitFallback
 
+	// Mldsa65Seed is the 32-byte ML-DSA-65 private key seed, the
+	// base64url-decoded value of Xray's "mldsa65Seed". When set, the temporary
+	// certificate carries an ML-DSA-65 signature in its first extension, which
+	// Xray clients configured with "mldsa65Verify" require. The matching
+	// "mldsa65Verify" value is returned by RealityMldsa65Verify.
+	Mldsa65Seed []byte
+
 	Config
 
 	// postHandshake caches the target's learned post-handshake record
 	// pattern. It is created lazily and shared with clones so that clones do
 	// not probe the target again.
 	postHandshake atomic.Pointer[realityPostHandshakeCache]
+
+	// mldsa65 caches the private key expanded from Mldsa65Seed.
+	mldsa65 atomic.Pointer[realityMldsa65Key]
 }
 
 func (a *RealityConfig) Clone() *RealityConfig {
@@ -140,6 +151,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		ShortIds:              a.ShortIds,
 		LimitFallbackUpload:   a.LimitFallbackUpload,
 		LimitFallbackDownload: a.LimitFallbackDownload,
+		Mldsa65Seed:           a.Mldsa65Seed,
 		Config:                *a.Config.Clone(),
 	}
 	c.postHandshake.Store(a.postHandshakeCache())
@@ -286,11 +298,31 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 	*/
 	{
 		ed25519Priv, signedCert := realityServerCert()
+		mldsa65Key, err := config.mldsa65Key()
+		if err != nil {
+			return err
+		}
+		mldsa65Offset := 0
+		if mldsa65Key != nil {
+			signedCert, mldsa65Offset = realityServerCertMldsa65()
+		}
 		signedCert = append([]byte{}, signedCert...)
 
 		h := hmac.New(sha512.New, hs.AuthKey)
 		h.Write(ed25519Priv[32:])
 		h.Sum(signedCert[:len(signedCert)-64])
+
+		if mldsa65Key != nil {
+			// Same construction as XTLS/REALITY: the HMAC keeps running over
+			// the raw ClientHello and the raw ServerHello as sent to the client.
+			h.Write(hs.clientHello.original)
+			h.Write(hs.hello.original)
+			sig, err := mldsa65Key.SignDeterministic(h.Sum(nil), nil)
+			if err != nil {
+				return err
+			}
+			copy(signedCert[mldsa65Offset:mldsa65Offset+mldsa.MLDSA65SignatureSize], sig)
+		}
 
 		hs.cert = &Certificate{
 			Certificate: [][]byte{signedCert},
