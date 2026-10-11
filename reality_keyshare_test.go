@@ -2,6 +2,7 @@ package tls
 
 import (
 	"bytes"
+	"net"
 	"testing"
 
 	"github.com/metacubex/utls/internal/mlkem"
@@ -60,5 +61,23 @@ func TestRealityRequireX25519MLKEM768(t *testing.T) {
 			realityTestReadMarker(t, uconn)
 		}
 		uconn.Close()
+	}
+}
+
+// Browser fingerprints with post-quantum key shares must pass the strict
+// check, so REALITY clients using them work with RequireX25519MLKEM768.
+func TestRealityClientPeerPubParrots(t *testing.T) {
+	for _, id := range []ClientHelloID{HelloChrome_Auto, HelloFirefox_Auto, HelloSafari_Auto, HelloFirefox_148, HelloSafari_26_3} {
+		uconn := UClient(&net.TCPConn{}, &Config{ServerName: realityTestServerName}, id)
+		if err := uconn.BuildHandshakeState(); err != nil {
+			t.Fatalf("%v: %v", id, err)
+		}
+		hello := new(clientHelloMsg)
+		if !hello.unmarshal(uconn.HandshakeState.Hello.Raw) {
+			t.Fatalf("%v: cannot parse ClientHello", id)
+		}
+		if realityClientPeerPub(hello.keyShares, true) == nil {
+			t.Errorf("%v: rejected with RequireX25519MLKEM768", id)
+		}
 	}
 }
