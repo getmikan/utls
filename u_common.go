@@ -395,13 +395,17 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 					return errors.New("key_share is required")
 				}
 
+				// Each entry is group (2 bytes) + key_exchange length (2 bytes).
+				if len(data["key_share"])%4 != 0 {
+					return errors.New("key_share must be a list of 4-byte (group, length) entries")
+				}
+
 				// need to add (zero) data per each key share, [10, 10, 0, 1] => [10, 10, 0, 1, 0]
 				fixedData := make([]byte, 0)
 				for i := 0; i < len(data["key_share"]); i += 4 {
 					fixedData = append(fixedData, data["key_share"][i:i+4]...)
-					for j := 0; j < int(data["key_share"][i+3]); j++ {
-						fixedData = append(fixedData, 0)
-					}
+					dataLen := int(data["key_share"][i+2])<<8 | int(data["key_share"][i+3])
+					fixedData = append(fixedData, make([]byte, dataLen)...)
 				}
 				// add uint16 length prefix
 				fixedData = append([]byte{uint8(len(fixedData) >> 8), uint8(len(fixedData) & 0xff)}, fixedData...)
@@ -579,6 +583,15 @@ func (chs *ClientHelloSpec) UnmarshalJSON(jsonB []byte) error {
 	var chsju ClientHelloSpecJSONUnmarshaler
 	if err := json.Unmarshal(jsonB, &chsju); err != nil {
 		return err
+	}
+
+	switch {
+	case chsju.CipherSuites == nil:
+		return errors.New("tls: ClientHello JSON: cipher_suites is required")
+	case chsju.CompressionMethods == nil:
+		return errors.New("tls: ClientHello JSON: compression_methods is required")
+	case chsju.Extensions == nil:
+		return errors.New("tls: ClientHello JSON: extensions is required")
 	}
 
 	*chs = chsju.ClientHelloSpec()

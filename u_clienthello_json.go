@@ -56,6 +56,9 @@ func (c *CipherSuitesJSONUnmarshaler) UnmarshalJSON(jsonStr []byte) error {
 }
 
 func (c *CipherSuitesJSONUnmarshaler) CipherSuites() []uint16 {
+	if c == nil {
+		return nil
+	}
 	return c.cipherSuites
 }
 
@@ -81,6 +84,9 @@ func (c *CompressionMethodsJSONUnmarshaler) UnmarshalJSON(jsonStr []byte) error 
 }
 
 func (c *CompressionMethodsJSONUnmarshaler) CompressionMethods() []uint8 {
+	if c == nil {
+		return nil
+	}
 	return c.compressionMethods
 }
 
@@ -148,6 +154,9 @@ func (e *TLSExtensionsJSONUnmarshaler) UnmarshalJSON(jsonStr []byte) error {
 }
 
 func (e *TLSExtensionsJSONUnmarshaler) Extensions() []TLSExtension {
+	if e == nil {
+		return nil
+	}
 	var exts []TLSExtension = make([]TLSExtension, 0, len(e.extensions))
 	for _, ext := range e.extensions {
 		exts = append(exts, ext)
