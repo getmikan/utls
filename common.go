@@ -21,6 +21,7 @@ import (
 	"golang.org/x/exp/slices"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -983,6 +984,13 @@ const maxSessionTicketLifetime = 7 * 24 * time.Hour
 
 // Clone returns a shallow clone of c or nil if c is nil. It is safe to clone a [Config] that is
 // being used concurrently by a TLS client or server.
+//
+// The returned Config can share session ticket keys with the original Config,
+// which means connections could be resumed across the two Configs. WARNING:
+// [Config.VerifyPeerCertificate] does not get called on resumed connections,
+// including connections that were originally established on the parent Config.
+// If that is not intended, use [Config.VerifyConnection] instead, or set
+// [Config.SessionTicketsDisabled].
 func (c *Config) Clone() *Config {
 	if c == nil {
 		return nil
@@ -1829,5 +1837,56 @@ func fipsAllowCert(c *x509.Certificate) bool {
 		return k.Curve == elliptic.P256() || k.Curve == elliptic.P384() || k.Curve == elliptic.P521()
 	}
 
+	return false
+}
+
+// anyValidVerifiedChain reports if at least one of the chains in verifiedChains
+// is valid, as indicated by none of the certificates being expired and the root
+// being in opts.Roots (or in the system root pool if opts.Roots is nil). If
+// verifiedChains is empty, it returns false.
+//
+// It is used on resumption, so that a session established under one trust
+// policy (RootCAs/ClientCAs) is not accepted under another (GO-2026-4337).
+func anyValidVerifiedChain(verifiedChains [][]*x509.Certificate, opts x509.VerifyOptions) bool {
+	for _, chain := range verifiedChains {
+		if len(chain) == 0 {
+			continue
+		}
+		expired := false
+		for _, cert := range chain {
+			if opts.CurrentTime.Before(cert.NotBefore) || opts.CurrentTime.After(cert.NotAfter) {
+				expired = true
+				break
+			}
+		}
+		if expired {
+			continue
+		}
+		// Since we already validated the chain, we only care that it is rooted
+		// in a CA in opts.Roots. On platforms where we control chain validation
+		// (e.g. not Windows or macOS) this is a simple lookup in the CertPool
+		// internal hash map, which we can simulate by running Verify on the
+		// root. On other platforms, we have to do full verification again,
+		// because EKU handling might differ.
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
+			opts.Intermediates = x509.NewCertPool()
+			end := len(chain) - 1
+			if end < 1 {
+				end = 1
+			}
+			for _, cert := range chain[1:end] {
+				opts.Intermediates.AddCert(cert)
+			}
+			leaf := chain[0]
+			if _, err := leaf.Verify(opts); err == nil {
+				return true
+			}
+		} else {
+			root := chain[len(chain)-1]
+			if _, err := root.Verify(opts); err == nil {
+				return true
+			}
+		}
+	}
 	return false
 }

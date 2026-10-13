@@ -505,6 +505,21 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 			}
 		}
 		// [UTLS SECTION END]
+		opts := x509.VerifyOptions{
+			CurrentTime: c.config.time(),
+			Roots:       c.config.RootCAs,
+			KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}
+		// [UTLS SECTION START]
+		if c.config.InsecureSkipTimeVerify {
+			opts.CurrentTime = session.peerCertificates[0].NotAfter
+		}
+		// [UTLS SECTION END]
+		if !anyValidVerifiedChain(session.verifiedChains, opts) {
+			// No valid chains under the current RootCAs, delete the entry.
+			c.config.ClientSessionCache.Put(cacheKey, nil)
+			return nil, nil, nil, nil
+		}
 	}
 
 	if session.version != VersionTLS13 {
