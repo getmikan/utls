@@ -579,7 +579,11 @@ func (uconn *UConn) MarshalClientHello() error {
 
 		ech.innerHello = inner
 
-		uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
+		// The outer ClientHello must not go out if it could not be built:
+		// without a sealed ECH extension it would not protect the inner one.
+		if err := uconn.computeAndUpdateOuterECHExtension(inner, ech, true); err != nil {
+			return err
+		}
 
 		uconn.echCtx = ech
 		return nil
