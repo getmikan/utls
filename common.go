@@ -334,6 +334,9 @@ type ConnectionState struct {
 // of RFC 5705 and RFC 7627), but can be re-enabled with the GODEBUG setting
 // tlsunsafeekm=1.
 func (cs *ConnectionState) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	if length < 0 {
+		return nil, errors.New("crypto/tls: ExportKeyingMaterial length is negative")
+	}
 	return cs.ekm(label, context, length)
 }
 
