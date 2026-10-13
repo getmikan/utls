@@ -811,8 +811,8 @@ type Config struct {
 	// By default, TLS 1.2 is currently used as the minimum. TLS 1.0 is the
 	// minimum supported by this package.
 	//
-	// The server-side default can be reverted to TLS 1.0 by including the value
-	// "tls10server=1" in the GODEBUG environment variable.
+	// [uTLS] The "tls10server=1" GODEBUG setting is not supported: set
+	// MinVersion to VersionTLS10 explicitly to accept TLS 1.0 on a server.
 	MinVersion uint16
 
 	// MaxVersion contains the maximum TLS version that is acceptable.
@@ -1235,9 +1235,9 @@ func (c *Config) supportedVersions(isClient bool) []uint16 {
 			// if isClient || tls10server.Value() != "1" {
 			// 	continue
 			// }
-			if isClient {
-				continue
-			}
+			// Without the godebug knob the documented default (TLS 1.2
+			// minimum) applies to servers as well as clients.
+			continue
 			// [uTLS SECTION END]
 		}
 		if isClient && c.EncryptedClientHelloConfigList != nil && v < VersionTLS13 {
