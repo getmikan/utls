@@ -4,7 +4,6 @@ package mlkem
 
 import (
 	"bytes"
-	drbg "crypto/rand"
 	"crypto/subtle"
 	"errors"
 
@@ -114,9 +113,9 @@ func GenerateKey1024() (*DecapsulationKey1024, error) {
 
 func generateKey1024(dk *DecapsulationKey1024) (*DecapsulationKey1024, error) {
 	var d [32]byte
-	drbg.Read(d[:])
+	randRead(d[:])
 	var z [32]byte
-	drbg.Read(z[:])
+	randRead(z[:])
 	kemKeyGen1024(dk, &d, &z)
 	return dk, nil
 }
@@ -189,7 +188,7 @@ func TestingOnlyNewDecapsulationKey1024(b []byte) (*DecapsulationKey1024, error)
 	// that avoids returning a broken key vs a random key if this function is
 	// called in contravention of the TestingOnlyNewDecapsulationKey1024 function
 	// comment advising against it.
-	drbg.Read(dk.d[:])
+	randRead(dk.d[:])
 
 	return dk, nil
 }
@@ -276,7 +275,7 @@ func (ek *EncapsulationKey1024) Encapsulate() (sharedKey, ciphertext []byte) {
 
 func (ek *EncapsulationKey1024) encapsulate(cc *[CiphertextSize1024]byte) (sharedKey, ciphertext []byte) {
 	var m [messageSize]byte
-	drbg.Read(m[:])
+	randRead(m[:])
 	return kemEncaps1024(cc, ek, &m)
 }
 
