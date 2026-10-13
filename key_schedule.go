@@ -46,6 +46,16 @@ func (c *cipherSuiteTLS13) finishedHash(baseKey []byte, transcript hash.Hash) []
 func (c *cipherSuiteTLS13) exportKeyingMaterial(s *tls13.MasterSecret, transcript hash.Hash) func(string, []byte, int) ([]byte, error) {
 	expMasterSecret := s.ExporterMasterSecret(transcript)
 	return func(label string, context []byte, length int) ([]byte, error) {
+		// HKDF-Expand-Label carries the label in an opaque<7..255> field
+		// (with the "tls13 " prefix) and the length in a uint16, and HKDF
+		// cannot produce more than 255 hash blocks. Reject what would not
+		// fit instead of panicking (or truncating the length).
+		if len("tls13 ")+len(label) > 255 {
+			return nil, errors.New("crypto/tls: ExportKeyingMaterial label too long")
+		}
+		if length < 0 || length > 0xffff || length > 255*c.hash.Size() {
+			return nil, errors.New("crypto/tls: ExportKeyingMaterial length out of range")
+		}
 		return expMasterSecret.Exporter(label, context, length), nil
 	}
 }
