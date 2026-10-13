@@ -94,14 +94,21 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 		return nil, fmt.Errorf("unsupported algorithm (%d)", m.algorithm)
 	}
 
+	// Apply the limit used for uncompressed certificate messages before
+	// allocating: uncompressed_length is up to 16 MiB and peer-controlled.
+	if m.uncompressedLength > maxHandshakeCertificateMsg {
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("uncompressed certificate message of length %d bytes exceeds maximum of %d bytes", m.uncompressedLength, maxHandshakeCertificateMsg)
+	}
+
 	rawMsg := make([]byte, m.uncompressedLength+4) // +4 for message type and uint24 length field
 	rawMsg[0] = typeCertificate
 	rawMsg[1] = uint8(m.uncompressedLength >> 16)
 	rawMsg[2] = uint8(m.uncompressedLength >> 8)
 	rawMsg[3] = uint8(m.uncompressedLength)
 
-	n, err := decompressed.Read(rawMsg[4:])
-	if err != nil && !errors.Is(err, io.EOF) {
+	n, err := io.ReadFull(decompressed, rawMsg[4:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		c.sendAlert(alertBadCertificate)
 		return nil, err
 	}
