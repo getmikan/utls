@@ -496,7 +496,11 @@ func testUtlsHandshake(t *testing.T, clientConfig, serverConfig *Config, spec *C
 		}
 		if spec != nil {
 			ucli := UClient(c, clientConfig, HelloCustom)
-			if err = ucli.ApplyPreset(spec); err != nil {
+			// Do not assign to the outer err: the test goroutine writes it
+			// concurrently, and returning without a send would block it.
+			if err := ucli.ApplyPreset(spec); err != nil {
+				errChan <- fmt.Errorf("client: %v", err)
+				c.Close()
 				return
 			}
 			cli = ucli
