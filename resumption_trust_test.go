@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"math/big"
 	"testing"
 	"time"
 )
@@ -29,6 +30,7 @@ func testHandshakeChainExpiryResumption(t *testing.T, version uint16) {
 
 	createChain := func(leafNotAfter, rootNotAfter time.Time) (leafDER, expiredLeafDER []byte, root *x509.Certificate) {
 		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
 			Subject:               pkix.Name{CommonName: "root"},
 			NotBefore:             rootNotAfter.Add(-time.Hour * 24),
 			NotAfter:              rootNotAfter,
@@ -45,11 +47,12 @@ func testHandshakeChainExpiryResumption(t *testing.T, version uint16) {
 		}
 
 		tmpl = &x509.Certificate{
-			Subject:   pkix.Name{},
-			DNSNames:  []string{"expired-resume.example.com"},
-			NotBefore: leafNotAfter.Add(-time.Hour * 24),
-			NotAfter:  leafNotAfter,
-			KeyUsage:  x509.KeyUsageDigitalSignature,
+			SerialNumber: big.NewInt(2),
+			Subject:      pkix.Name{},
+			DNSNames:     []string{"expired-resume.example.com"},
+			NotBefore:    leafNotAfter.Add(-time.Hour * 24),
+			NotAfter:     leafNotAfter,
+			KeyUsage:     x509.KeyUsageDigitalSignature,
 		}
 		leafCertDER, err := x509.CreateCertificate(rand.Reader, tmpl, root, &testECDSAPrivateKey.PublicKey, testECDSAPrivateKey)
 		if err != nil {
@@ -148,6 +151,7 @@ func TestHandshakeGetConfigForClientDifferentClientCAs(t *testing.T) {
 func testHandshakeGetConfigForClientDifferentClientCAs(t *testing.T, version uint16) {
 	now := time.Now()
 	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "root"},
 		NotBefore:             now.Add(-time.Hour * 24),
 		NotAfter:              now.Add(time.Hour * 24),
@@ -172,11 +176,12 @@ func testHandshakeGetConfigForClientDifferentClientCAs(t *testing.T, version uin
 	}
 
 	tmpl = &x509.Certificate{
-		Subject:   pkix.Name{},
-		DNSNames:  []string{"example.com"},
-		NotBefore: now.Add(-time.Hour * 24),
-		NotAfter:  now.Add(time.Hour * 24),
-		KeyUsage:  x509.KeyUsageDigitalSignature,
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{},
+		DNSNames:     []string{"example.com"},
+		NotBefore:    now.Add(-time.Hour * 24),
+		NotAfter:     now.Add(time.Hour * 24),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 	}
 	certA, err := x509.CreateCertificate(rand.Reader, tmpl, rootA, &testECDSAPrivateKey.PublicKey, testECDSAPrivateKey)
 	if err != nil {
@@ -266,6 +271,7 @@ func TestHandshakeChangeRootCAsResumption(t *testing.T) {
 func testHandshakeChangeRootCAsResumption(t *testing.T, version uint16) {
 	now := time.Now()
 	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "root"},
 		NotBefore:             now.Add(-time.Hour * 24),
 		NotAfter:              now.Add(time.Hour * 24),
@@ -290,11 +296,12 @@ func testHandshakeChangeRootCAsResumption(t *testing.T, version uint16) {
 	}
 
 	tmpl = &x509.Certificate{
-		Subject:   pkix.Name{},
-		DNSNames:  []string{"example.com"},
-		NotBefore: now.Add(-time.Hour * 24),
-		NotAfter:  now.Add(time.Hour * 24),
-		KeyUsage:  x509.KeyUsageDigitalSignature,
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{},
+		DNSNames:     []string{"example.com"},
+		NotBefore:    now.Add(-time.Hour * 24),
+		NotAfter:     now.Add(time.Hour * 24),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 	}
 	certA, err := x509.CreateCertificate(rand.Reader, tmpl, rootA, &testECDSAPrivateKey.PublicKey, testECDSAPrivateKey)
 	if err != nil {
