@@ -1277,12 +1277,6 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	c.activeCertHandles = activeHandles
 	c.peerCertificates = certs
 
-	// JLS BEGIN: external verifiers are skipped after successful JLS authentication.
-	if c.jlsAuthenticated() {
-		return nil
-	}
-	// JLS END
-
 	if c.config.VerifyPeerCertificate != nil && !echRejected {
 		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
 			c.sendAlert(alertBadCertificate)
