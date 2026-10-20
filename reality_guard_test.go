@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,10 +52,11 @@ func TestRealitySilentHandshakeTimesOut(t *testing.T) {
 
 func TestRealityFallbackOutlivesHandshakeTimeout(t *testing.T) {
 	client, server := net.Pipe()
+	notifier := &realityHandshakeNotifier{Conn: server}
 	target, peer := net.Pipe()
 	done := make(chan struct{})
 	config := &RealityConfig{HandshakeTimeout: 100 * time.Millisecond, DialContext: func(context.Context, string, string) (net.Conn, error) { return target, nil }}
-	go func() { defer close(done); RealityServer(context.Background(), server, config) }()
+	go func() { defer close(done); RealityServer(context.Background(), notifier, config) }()
 	defer func() { client.Close(); peer.Close(); <-done }()
 	go func() {
 		defer peer.Close()
@@ -83,8 +85,18 @@ func TestRealityFallbackOutlivesHandshakeTimeout(t *testing.T) {
 		if string(data[:]) != "hello" {
 			t.Fatal("fallback changed bytes")
 		}
+		if notifier.calls.Load() != 1 {
+			t.Fatal("fallback did not release the hosting listener's handshake guard exactly once")
+		}
 	}
 }
+
+type realityHandshakeNotifier struct {
+	net.Conn
+	calls atomic.Int32
+}
+
+func (c *realityHandshakeNotifier) HandshakeComplete() { c.calls.Add(1) }
 
 func TestRealityMirrorHonorsReadDeadline(t *testing.T) {
 	a, b := net.Pipe()

@@ -67,6 +67,9 @@ func guardRealityHandshake(ctx context.Context, conn, target net.Conn, timeout t
 			close(stopped)
 			timer.Stop()
 			_ = conn.SetReadDeadline(time.Time{})
+			if notifier, ok := conn.(interface{ HandshakeComplete() }); ok {
+				notifier.HandshakeComplete()
+			}
 		})
 	}
 }
