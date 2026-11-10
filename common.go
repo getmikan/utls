@@ -447,6 +447,12 @@ const (
 	// EdDSA algorithms.
 	Ed25519 SignatureScheme = 0x0807
 
+	// ML-DSA algorithms (draft-ietf-tls-mldsa). uTLS only advertises these
+	// codepoints for ClientHello parroting; it cannot verify ML-DSA signatures.
+	MLDSA44 SignatureScheme = 0x0904
+	MLDSA65 SignatureScheme = 0x0905
+	MLDSA87 SignatureScheme = 0x0906
+
 	// Legacy signature and hash algorithms for TLS 1.2.
 	PKCS1WithSHA1 SignatureScheme = 0x0201
 	ECDSAWithSHA1 SignatureScheme = 0x0203
