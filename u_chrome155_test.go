@@ -269,6 +269,51 @@ func chrome155TrustAnchors(t *testing.T, extensions []TLSExtension) *TrustAnchor
 	return nil
 }
 
+// TestChrome155PresetOwnership checks that ApplyPreset clones the spec, so
+// neither the reusable preset nor other connections see per-connection
+// mutations (ported from refraction-networking/utls 6ebdceb2, which needs
+// ClientHelloSpec.clone available since v1.9).
+func TestChrome155PresetOwnership(t *testing.T) {
+	spec, err := UTLSIdToSpec(HelloChrome_155)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := spec.clone()
+	first := chrome155Build(t, HelloCustom, "example.com", &spec)
+	second := chrome155Build(t, HelloCustom, "example.com", &spec)
+	if !reflect.DeepEqual(&spec, before) {
+		t.Fatal("ApplyPreset mutated the reusable Chrome 155 preset")
+	}
+	anchors := chrome155TrustAnchors(t, first.Extensions)
+	if len(anchors.TrustAnchorIDs) == 0 || len(anchors.TrustAnchorIDs[0]) == 0 {
+		t.Fatal("Chrome 155 capture must contain trust anchor IDs")
+	}
+	anchors.TrustAnchorIDs[0][0] ^= 0xff
+	for _, extension := range first.Extensions {
+		switch extension := extension.(type) {
+		case *SignatureAlgorithmsExtension:
+			extension.SupportedSignatureAlgorithms[0] = PKCS1WithSHA1
+		case *SupportedCurvesExtension:
+			extension.Curves[0] = CurveP384
+		}
+	}
+	first.HandshakeState.Hello.CipherSuites[0] = TLS_RSA_WITH_AES_256_CBC_SHA
+	if !reflect.DeepEqual(&spec, before) {
+		t.Fatal("connection mutations leaked into the reusable Chrome 155 preset")
+	}
+	wantAnchors := chrome155TrustAnchors(t, before.Extensions).TrustAnchorIDs
+	if !reflect.DeepEqual(chrome155TrustAnchors(t, second.Extensions).TrustAnchorIDs, wantAnchors) {
+		t.Fatal("nested trust anchor mutations leaked between connections")
+	}
+	later, err := UTLSIdToSpec(HelloChrome_155)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(chrome155TrustAnchors(t, later.Extensions).TrustAnchorIDs, wantAnchors) {
+		t.Fatal("trust anchor mutations leaked into future preset instances")
+	}
+}
+
 func TestChrome155SignatureGREASESeed(t *testing.T) {
 	client := UClient(&net.TCPConn{}, &Config{
 		ServerName: "example.com",
