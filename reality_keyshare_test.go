@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/metacubex/utls/internal/mlkem"
+	"github.com/metacubex/utls/mlkem"
 )
 
 func TestRealityClientPeerPub(t *testing.T) {

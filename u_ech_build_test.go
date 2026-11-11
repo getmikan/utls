@@ -9,8 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/metacubex/utls/internal/hpke"
 	"golang.org/x/crypto/cryptobyte"
+)
+
+// HPKE identifiers (RFC 9180) for the test ECH config.
+const (
+	testHPKEKEMX25519     = 0x0020 // DHKEM(X25519, HKDF-SHA256)
+	testHPKEKDFSHA256     = 0x0001 // HKDF-SHA256
+	testHPKEAEADAES128GCM = 0x0001 // AES-128-GCM
+	testHPKEAEADChaCha20  = 0x0003 // ChaCha20Poly1305
 )
 
 // testECHConfigList returns an ECHConfigList with a single X25519 config.
@@ -25,13 +32,13 @@ func testECHConfigList(t *testing.T, publicName string) []byte {
 		builder.AddUint16(extensionEncryptedClientHello)
 		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
 			builder.AddUint8(1)
-			builder.AddUint16(hpke.DHKEM_X25519_HKDF_SHA256)
+			builder.AddUint16(testHPKEKEMX25519)
 			builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
 				builder.AddBytes(echKey.PublicKey().Bytes())
 			})
 			builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
-				for _, aeadID := range sortedSupportedAEADs {
-					builder.AddUint16(hpke.KDF_HKDF_SHA256)
+				for _, aeadID := range []uint16{testHPKEAEADAES128GCM, testHPKEAEADChaCha20} {
+					builder.AddUint16(testHPKEKDFSHA256)
 					builder.AddUint16(aeadID)
 				}
 			})

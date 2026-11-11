@@ -4,7 +4,7 @@ package tls
 // REALITY ClientHello, optionally requiring X25519MLKEM768 like Xray
 // (XTLS/REALITY@8cdf7bf).
 
-import "github.com/metacubex/utls/internal/mlkem"
+import "github.com/metacubex/utls/mlkem"
 
 // realityClientPeerPub picks the X25519 public key used to derive the REALITY
 // auth key: the X25519 key share, else the X25519 part of X25519MLKEM768.
