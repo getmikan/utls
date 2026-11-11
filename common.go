@@ -359,6 +359,9 @@ type ConnectionState struct {
 // of RFC 5705 and RFC 7627), but can be re-enabled with the GODEBUG setting
 // tlsunsafeekm=1.
 func (cs *ConnectionState) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	if length < 0 {
+		return nil, errors.New("crypto/tls: ExportKeyingMaterial length is negative")
+	}
 	return cs.ekm(label, context, length)
 }
 
@@ -443,6 +446,12 @@ const (
 
 	// EdDSA algorithms.
 	Ed25519 SignatureScheme = 0x0807
+
+	// ML-DSA algorithms (draft-ietf-tls-mldsa). uTLS only advertises these
+	// codepoints for ClientHello parroting; it cannot verify ML-DSA signatures.
+	MLDSA44 SignatureScheme = 0x0904
+	MLDSA65 SignatureScheme = 0x0905
+	MLDSA87 SignatureScheme = 0x0906
 
 	// Legacy signature and hash algorithms for TLS 1.2.
 	PKCS1WithSHA1 SignatureScheme = 0x0201
@@ -851,8 +860,8 @@ type Config struct {
 	// By default, TLS 1.2 is currently used as the minimum. TLS 1.0 is the
 	// minimum supported by this package.
 	//
-	// The server-side default can be reverted to TLS 1.0 by including the value
-	// "tls10server=1" in the GODEBUG environment variable.
+	// [uTLS] The "tls10server=1" GODEBUG setting is not supported: set
+	// MinVersion to VersionTLS10 explicitly to accept TLS 1.0 on a server.
 	MinVersion uint16
 
 	// MaxVersion contains the maximum TLS version that is acceptable.
@@ -1320,9 +1329,9 @@ func (c *Config) supportedVersions(isClient bool) []uint16 {
 			// if isClient || tls10server.Value() != "1" {
 			// 	continue
 			// }
-			if isClient {
-				continue
-			}
+			// Without the godebug knob the documented default (TLS 1.2
+			// minimum) applies to servers as well as clients.
+			continue
 			// [uTLS SECTION END]
 		}
 		if isClient && c.EncryptedClientHelloConfigList != nil && v < VersionTLS13 {

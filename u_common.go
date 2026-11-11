@@ -41,6 +41,7 @@ const (
 	utlsFakeExtensionCustom             uint16 = 1234   // not IANA assigned, for ALPS
 	utlsExtensionECH                    uint16 = 0xfe0d // draft-ietf-tls-esni-17
 	utlsExtensionECHOuterExtensions     uint16 = 0xfd00 // draft-ietf-tls-esni-17
+	utlsExtensionTrustAnchors           uint16 = 0xca34 // draft-ietf-tls-trust-anchor-ids
 
 	// extensions with 'fake' prefix break connection, if server echoes them back
 	fakeExtensionEncryptThenMAC       uint16 = 22
@@ -395,13 +396,17 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 					return errors.New("key_share is required")
 				}
 
+				// Each entry is group (2 bytes) + key_exchange length (2 bytes).
+				if len(data["key_share"])%4 != 0 {
+					return errors.New("key_share must be a list of 4-byte (group, length) entries")
+				}
+
 				// need to add (zero) data per each key share, [10, 10, 0, 1] => [10, 10, 0, 1, 0]
 				fixedData := make([]byte, 0)
 				for i := 0; i < len(data["key_share"]); i += 4 {
 					fixedData = append(fixedData, data["key_share"][i:i+4]...)
-					for j := 0; j < int(data["key_share"][i+3]); j++ {
-						fixedData = append(fixedData, 0)
-					}
+					dataLen := int(data["key_share"][i+2])<<8 | int(data["key_share"][i+3])
+					fixedData = append(fixedData, make([]byte, dataLen)...)
 				}
 				// add uint16 length prefix
 				fixedData = append([]byte{uint8(len(fixedData) >> 8), uint8(len(fixedData) & 0xff)}, fixedData...)
@@ -581,6 +586,15 @@ func (chs *ClientHelloSpec) UnmarshalJSON(jsonB []byte) error {
 		return err
 	}
 
+	switch {
+	case chsju.CipherSuites == nil:
+		return errors.New("tls: ClientHello JSON: cipher_suites is required")
+	case chsju.CompressionMethods == nil:
+		return errors.New("tls: ClientHello JSON: compression_methods is required")
+	case chsju.Extensions == nil:
+		return errors.New("tls: ClientHello JSON: extensions is required")
+	}
+
 	*chs = chsju.ClientHelloSpec()
 	return nil
 }
@@ -613,7 +627,7 @@ var (
 	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
 	HelloFirefox_148  = ClientHelloID{helloFirefox, "148", nil, nil}
 
-	HelloChrome_Auto        = HelloChrome_133
+	HelloChrome_Auto        = HelloChrome_155
 	HelloChrome_58          = ClientHelloID{helloChrome, "58", nil, nil}
 	HelloChrome_62          = ClientHelloID{helloChrome, "62", nil, nil}
 	HelloChrome_70          = ClientHelloID{helloChrome, "70", nil, nil}
@@ -645,6 +659,9 @@ var (
 	HelloChrome_131 = ClientHelloID{helloChrome, "131", nil, nil}
 	// Chrome w/ New ALPS codepoint
 	HelloChrome_133 = ClientHelloID{helloChrome, "133", nil, nil}
+	// Chrome 155.0.8059.40 on macOS, with ML-DSA signatures and a snapshot of
+	// the Chrome Root Store trust anchor IDs. See testdata/chrome155_clienthello.md.
+	HelloChrome_155 = ClientHelloID{helloChrome, "155", nil, nil}
 
 	HelloIOS_Auto = HelloIOS_14
 	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1

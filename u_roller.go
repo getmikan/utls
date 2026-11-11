@@ -88,6 +88,7 @@ func (c *Roller) Dial(network, addr, serverName string) (*UConn, error) {
 		err = client.Handshake()
 		client.SetDeadline(time.Time{}) // unset timeout
 		if err != nil {
+			tcpConn.Close()
 			continue // on tls Dial error keep trying HelloIDs
 		}
 

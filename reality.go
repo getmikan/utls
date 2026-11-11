@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
@@ -20,12 +21,13 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mldsa"
 	"github.com/metacubex/utls/internal/ratelimit"
 	"github.com/metacubex/utls/mlkem"
 
-	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -58,18 +60,22 @@ func (c *realityMirrorConn) Close() error {
 }
 
 func (c *realityMirrorConn) SetDeadline(t time.Time) error {
-	return nil
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *realityMirrorConn) SetReadDeadline(t time.Time) error {
-	return nil
+	return c.Conn.SetReadDeadline(t)
 }
 
 func (c *realityMirrorConn) SetWriteDeadline(t time.Time) error {
-	return nil
+	return c.Conn.SetWriteDeadline(t)
 }
 
-const realitySize uint16 = 16384
+// realitySize bounds the target's first flight buffered by the REALITY
+// server. It is 17 KiB (XTLS/REALITY#33) so that targets sending full-size
+// TLS 1.3 records (up to 2^14+256 bytes of ciphertext) are mirrored instead of
+// being rejected as too long.
+const realitySize uint16 = 17 * 1024
 
 var realityTypes = [7]string{
 	"Server Hello",
@@ -112,11 +118,38 @@ type RealityConfig struct {
 	LimitFallbackUpload   RealityLimitFallback
 	LimitFallbackDownload RealityLimitFallback
 
+	// HandshakeTimeout bounds authentication and the TLS handshake, until the
+	// connection is accepted or handed to fallback. Zero uses 15 seconds.
+	// A fallback relay has no total duration limit imposed by this setting.
+	HandshakeTimeout time.Duration
+
+	// Mldsa65Seed is the 32-byte ML-DSA-65 private key seed, the
+	// base64url-decoded value of Xray's "mldsa65Seed". When set, the temporary
+	// certificate carries an ML-DSA-65 signature in its first extension, which
+	// Xray clients configured with "mldsa65Verify" require. The matching
+	// "mldsa65Verify" value is returned by RealityMldsa65Verify.
+	Mldsa65Seed []byte
+
+	// RequireX25519MLKEM768 makes the server treat a ClientHello as
+	// unauthenticated (and forward it to the target) unless it carries exactly
+	// one X25519MLKEM768 key share placed before an optional X25519 key share,
+	// as Xray does since XTLS/REALITY@8cdf7bf. Off by default for older clients.
+	RequireX25519MLKEM768 bool
+
 	Config
+
+	// postHandshake caches the target's learned post-handshake record
+	// pattern. It is created lazily and shared with clones so that clones do
+	// not probe the target again.
+	postHandshake atomic.Pointer[realityPostHandshakeCache]
+
+	// mldsa65 caches the private key expanded from Mldsa65Seed.
+	mldsa65 atomic.Pointer[realityMldsa65Key]
+	ecdhKey atomic.Pointer[realityECDHKey]
 }
 
 func (a *RealityConfig) Clone() *RealityConfig {
-	return &RealityConfig{
+	c := &RealityConfig{
 		DialContext:           a.DialContext,
 		Log:                   a.Log,
 		Type:                  a.Type,
@@ -130,8 +163,14 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		ShortIds:              a.ShortIds,
 		LimitFallbackUpload:   a.LimitFallbackUpload,
 		LimitFallbackDownload: a.LimitFallbackDownload,
+		HandshakeTimeout:      a.HandshakeTimeout,
+		Mldsa65Seed:           a.Mldsa65Seed,
+		RequireX25519MLKEM768: a.RequireX25519MLKEM768,
 		Config:                *a.Config.Clone(),
 	}
+	c.postHandshake.Store(a.postHandshakeCache())
+	c.ecdhKey.Store(a.ecdhKey.Load())
+	return c
 }
 
 type rateLimitedConn struct {
@@ -141,6 +180,10 @@ type rateLimitedConn struct {
 }
 
 func (c *rateLimitedConn) Read(b []byte) (int, error) {
+	// Do not let the last free read cross the configured threshold.
+	if c.After > 0 && int64(len(b)) > c.After {
+		b = b[:int(c.After)]
+	}
 	n, err := c.Conn.Read(b)
 	if n != 0 {
 		if c.After > 0 {
@@ -212,6 +255,10 @@ type realityServerHandshakeStateTLS13 struct {
 	ClientTime    time.Time
 	ClientShortId [8]byte
 	Config        *RealityConfig
+
+	// firstFlightPostHandshakeRecords counts the records after the server
+	// Finished that were already mirrored in the first flight.
+	firstFlightPostHandshakeRecords int
 }
 
 func (hs *realityServerHandshakeStateTLS13) handshake() error {
@@ -270,11 +317,31 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 	*/
 	{
 		ed25519Priv, signedCert := realityServerCert()
+		mldsa65Key, err := config.mldsa65Key()
+		if err != nil {
+			return err
+		}
+		mldsa65Offset := 0
+		if mldsa65Key != nil {
+			signedCert, mldsa65Offset = realityServerCertMldsa65()
+		}
 		signedCert = append([]byte{}, signedCert...)
 
 		h := hmac.New(sha512.New, hs.AuthKey)
 		h.Write(ed25519Priv[32:])
 		h.Sum(signedCert[:len(signedCert)-64])
+
+		if mldsa65Key != nil {
+			// Same construction as XTLS/REALITY: the HMAC keeps running over
+			// the raw ClientHello and the raw ServerHello as sent to the client.
+			h.Write(hs.clientHello.original)
+			h.Write(hs.hello.original)
+			sig, err := mldsa65Key.SignDeterministic(h.Sum(nil), nil)
+			if err != nil {
+				return err
+			}
+			copy(signedCert[mldsa65Offset:mldsa65Offset+mldsa.MLDSA65SignatureSize], sig)
+		}
 
 		hs.cert = &Certificate{
 			Certificate: [][]byte{signedCert},
@@ -296,6 +363,7 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		if _, err := c.realityWriteRecord(recordTypeHandshake, []byte{typeNewSessionTicket}); err != nil {
 			return err
 		}
+		hs.firstFlightPostHandshakeRecords++
 	}
 	// Note that at this point we could start sending application data without
 	// waiting for the client's second flight, but the application might not
@@ -353,6 +421,8 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		conn.Close()
 		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
 	}
+	stopHandshake := guardRealityHandshake(ctx, conn, target, config.HandshakeTimeout)
+	defer stopHandshake()
 
 	underlying := conn
 
@@ -368,7 +438,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				},
 				config: &config.Config,
 			},
-			ctx: context.Background(),
+			ctx: ctx,
 		},
 		Config: config,
 	}
@@ -381,27 +451,26 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	go func() {
 		for {
 			mutex.Lock()
-			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
+			hs.clientHello, _, err = hs.c.readClientHello(ctx) // TODO: Change some rules in this function.
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
-			var peerPub []byte
-			for _, keyShare := range hs.clientHello.keyShares {
-				if keyShare.group == X25519 && len(keyShare.data) == 32 {
-					peerPub = keyShare.data
-					break
-				}
-			}
-			if peerPub == nil {
-				for _, keyShare := range hs.clientHello.keyShares {
-					if keyShare.group == X25519MLKEM768 && len(keyShare.data) == mlkem.EncapsulationKeySize768+32 {
-						peerPub = keyShare.data[mlkem.EncapsulationKeySize768:]
-						break
-					}
-				}
+			peerPub := realityClientPeerPub(hs.clientHello.keyShares, config.RequireX25519MLKEM768)
+			if peerPub == nil && config.Log != nil {
+				config.Log("REALITY remoteAddr: %v no acceptable key share", remoteAddr)
 			}
 			for peerPub != nil {
-				if hs.AuthKey, err = curve25519.X25519(config.PrivateKey, peerPub); err != nil {
+				privateKey, keyErr := config.realityPrivateKey()
+				if keyErr != nil {
+					err = keyErr
+					break
+				}
+				publicKey, keyErr := ecdh.X25519().NewPublicKey(peerPub)
+				if keyErr != nil {
+					err = keyErr
+					break
+				}
+				if hs.AuthKey, err = privateKey.ECDH(publicKey); err != nil {
 					break
 				}
 				if _, err = hkdf.New(sha256.New, hs.AuthKey, hs.clientHello.random[:20], []byte("REALITY")).Read(hs.AuthKey); err != nil {
@@ -409,9 +478,6 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				}
 				block, _ := aes.NewCipher(hs.AuthKey)
 				aead, _ := cipher.NewGCM(block)
-				if config.Log != nil {
-					config.Log("REALITY remoteAddr: %v hs.c.AuthKey[:16]: %v AEAD: %T", remoteAddr, hs.AuthKey[:16], aead)
-				}
 				ciphertext := make([]byte, 32)
 				plainText := make([]byte, 32)
 				copy(ciphertext, hs.clientHello.sessionId)
@@ -426,7 +492,6 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				if config.Log != nil {
 					config.Log("REALITY remoteAddr: %v hs.c.ClientVer: %v", remoteAddr, hs.ClientVer)
 					config.Log("REALITY remoteAddr: %v hs.c.ClientTime: %v", remoteAddr, hs.ClientTime)
-					config.Log("REALITY remoteAddr: %v hs.c.ClientShortId: %v", remoteAddr, hs.ClientShortId)
 				}
 				if (config.MinClientVer == nil || realityValue(hs.ClientVer[:]...) >= realityValue(config.MinClientVer...)) &&
 					(config.MaxClientVer == nil || realityValue(hs.ClientVer[:]...) <= realityValue(config.MaxClientVer...)) &&
@@ -443,6 +508,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		}
 		mutex.Unlock()
 		if hs.c.conn != conn {
+			stopHandshake()
 			if config.Log != nil && hs.clientHello != nil {
 				config.Log("REALITY remoteAddr: %v forwarded SNI: %v", remoteAddr, hs.clientHello.serverName)
 			}
@@ -452,8 +518,17 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	}()
 
 	go func() {
-		s2cSaved := make([]byte, 0, realitySize)
-		buf := make([]byte, realitySize)
+		savedBlock := realityBufferPool.Get().(*[realitySize]byte)
+		defer realityBufferPool.Put(savedBlock)
+		s2cSaved := savedBlock[:0]
+		readBlock := realityBufferPool.Get().(*[realitySize]byte)
+		probeOwnsBuffer := false
+		defer func() {
+			if !probeOwnsBuffer {
+				realityBufferPool.Put(readBlock)
+			}
+		}()
+		buf := readBlock[:]
 		handshakeLen := 0
 	f:
 		for {
@@ -536,7 +611,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			if err != nil {
 				break
 			}
+			probeOwnsBuffer = true
 			go func() { // TODO: Probe target's maxUselessRecords and some time-outs in advance.
+				defer realityBufferPool.Put(readBlock)
 				if handshakeLen-len(s2cSaved) > 0 {
 					io.ReadFull(target, buf[:handshakeLen-len(s2cSaved)])
 				}
@@ -556,11 +633,20 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			if err != nil {
 				break
 			}
+			err = hs.imitatePostHandshakeRecords()
+			if err != nil {
+				if config.Log != nil {
+					config.Log("REALITY remoteAddr: %v hs.imitatePostHandshakeRecords() err: %v", remoteAddr, err)
+				}
+				break
+			}
 			hs.c.isHandshakeComplete.Store(true)
+			stopHandshake()
 			break
 		}
 		mutex.Unlock()
 		if hs.c.out.handshakeLen[0] == 0 { // if the target sent an incorrect Server Hello, or before that
+			stopHandshake()
 			if hs.c.conn == conn { // if we processed the Client Hello successfully but the target did not
 				waitGroup.Add(1)
 				go func() {

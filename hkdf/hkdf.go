@@ -11,6 +11,7 @@
 package hkdf
 
 import (
+	"errors"
 	"hash"
 
 	"github.com/metacubex/utls/internal/hkdf"
@@ -34,6 +35,9 @@ func Extract[H hash.Hash](h func() H, secret, salt []byte) ([]byte, error) {
 // random or pseudorandom cryptographically strong key. See RFC 5869, Section
 // 3.3. Most common scenarios will want to use [Key] instead.
 func Expand[H hash.Hash](h func() H, pseudorandomKey []byte, info string, keyLength int) ([]byte, error) {
+	if err := checkKeyLength(h, keyLength); err != nil {
+		return nil, err
+	}
 	return hkdf.Expand(h, pseudorandomKey, info, keyLength), nil
 }
 
@@ -41,5 +45,20 @@ func Expand[H hash.Hash](h func() H, pseudorandomKey []byte, info string, keyLen
 // returning a []byte of length keyLength that can be used as cryptographic key.
 // Salt and info can be nil.
 func Key[Hash hash.Hash](h func() Hash, secret, salt []byte, info string, keyLength int) ([]byte, error) {
+	if err := checkKeyLength(h, keyLength); err != nil {
+		return nil, err
+	}
 	return hkdf.Key(h, secret, salt, info, keyLength), nil
+}
+
+// checkKeyLength enforces the RFC 5869 limit of 255 hash blocks, as
+// crypto/hkdf does, and rejects negative lengths.
+func checkKeyLength[H hash.Hash](h func() H, keyLength int) error {
+	if keyLength < 0 {
+		return errors.New("hkdf: requested key length is negative")
+	}
+	if keyLength > 255*h().Size() {
+		return errors.New("hkdf: requested key length too large")
+	}
+	return nil
 }

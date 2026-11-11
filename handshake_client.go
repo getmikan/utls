@@ -1194,6 +1194,9 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	echRejected := c.config.EncryptedClientHelloConfigList != nil && !c.echAccepted
 	if echRejected {
 		if c.config.EncryptedClientHelloRejectionVerify != nil {
+			// The callback exists to verify the ECH provider (outer) certificate,
+			// so it must see the certificates the server sent.
+			c.peerCertificates = certs
 			if err := c.config.EncryptedClientHelloRejectionVerify(c.connectionStateLocked()); err != nil {
 				c.sendAlert(alertBadCertificate)
 				return err
@@ -1282,12 +1285,6 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 
 	c.activeCertHandles = activeHandles
 	c.peerCertificates = certs
-
-	// JLS BEGIN: external verifiers are skipped after successful JLS authentication.
-	if c.jlsAuthenticated() {
-		return nil
-	}
-	// JLS END
 
 	if c.config.VerifyPeerCertificate != nil && !echRejected {
 		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
