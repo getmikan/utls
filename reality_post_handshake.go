@@ -10,8 +10,16 @@ package tls
 // on the live connection, because the real client's Finished is never
 // forwarded to the target once the client has been authenticated. Instead, the
 // wire lengths of those records are learned once per (target, SNI, ALPN,
-// cipher suite) with an asynchronous probe handshake and replayed as empty
-// application_data records of the same length after the client's Finished.
+// cipher suite) with a probe handshake and replayed as empty application_data
+// records of the same length after the client's Finished.
+//
+// A client that came before the pattern was learned would get no such records
+// while the target sends them: the first connection after a start would look
+// unlike every later one and unlike the target. So the patterns of the usual
+// handshakes are learned ahead, on the first connection of any kind
+// (warmPostHandshake), the probe of a new key starts as soon as the target's
+// ServerHello names the cipher suite, and a client whose pattern is still being
+// learned waits for it, for a short bounded time.
 
 import (
 	"context"
@@ -50,7 +58,21 @@ var (
 	// realityPostHandshakeRetryInterval is the minimum delay before a failed
 	// probe is attempted again for the same key.
 	realityPostHandshakeRetryInterval = time.Minute
+	// realityPostHandshakeQuiet ends a probe's collection early: once the
+	// target has sent nothing for this long, or for as long as the probe's own
+	// dial and handshake took if that is longer, it is taken to be done. A
+	// target sends these records right after the client's Finished, so the
+	// whole collect window is only for one that keeps sending.
+	realityPostHandshakeQuiet = 400 * time.Millisecond
+	// realityPostHandshakeWait bounds how long a client waits for a pattern
+	// that is being learned, counted from the start of the probe: a probe that
+	// hangs holds up only the clients of its first moments.
+	realityPostHandshakeWait = 2 * time.Second
 )
+
+// realityWarmServerNames bounds the server names whose patterns are learned
+// ahead; a config with more learns the rest on demand.
+const realityWarmServerNames = 4
 
 // realityPostHandshakeKey identifies a learned post-handshake record pattern.
 // The key space is bounded by RealityConfig.ServerNames, the three ALPN modes
@@ -65,7 +87,8 @@ type realityPostHandshakeKey struct {
 }
 
 type realityPostHandshakeEntry struct {
-	done chan struct{} // closed when the probe finished; fields below are valid after that
+	started time.Time     // when the probe began
+	done    chan struct{} // closed when the probe finished; fields below are valid after that
 
 	lens     []uint16
 	ok       bool
@@ -76,38 +99,95 @@ type realityPostHandshakeEntry struct {
 type realityPostHandshakeCache struct {
 	mu      sync.Mutex
 	entries map[realityPostHandshakeKey]*realityPostHandshakeEntry
+	warmed  bool // warmPostHandshake ran
 }
 
 func newRealityPostHandshakeCache() *realityPostHandshakeCache {
 	return &realityPostHandshakeCache{entries: make(map[realityPostHandshakeKey]*realityPostHandshakeEntry)}
 }
 
-// lookup returns the learned record lengths for key. When nothing has been
-// learned yet it starts at most one probe for the key and returns ok=false
-// without blocking.
-func (c *realityPostHandshakeCache) lookup(config *RealityConfig, key realityPostHandshakeKey) (lens []uint16, ok bool) {
+// start returns the entry of key, beginning at most one probe for it: when
+// nothing was learned yet, or when the last probe failed long enough ago. It
+// does not block.
+func (c *realityPostHandshakeCache) start(config *RealityConfig, key realityPostHandshakeKey) *realityPostHandshakeEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if e := c.entries[key]; e != nil {
 		select {
 		case <-e.done:
-			if e.ok {
-				return e.lens, true
-			}
-			if time.Since(e.finished) < realityPostHandshakeRetryInterval {
-				return nil, false
+			if e.ok || time.Since(e.finished) < realityPostHandshakeRetryInterval {
+				return e
 			}
 			// A stale failure: probe again below.
 		default:
-			return nil, false // probe in flight
+			return e // probe in flight
 		}
 	}
 
-	e := &realityPostHandshakeEntry{done: make(chan struct{})}
+	e := &realityPostHandshakeEntry{started: time.Now(), done: make(chan struct{})}
 	c.entries[key] = e
 	go e.run(config, key)
-	return nil, false
+	return e
+}
+
+// lookup returns the learned record lengths for key. A pattern that is still
+// being learned is waited for until realityPostHandshakeWait after its probe
+// began; past that, and after a probe that failed, it returns ok=false at once.
+func (c *realityPostHandshakeCache) lookup(config *RealityConfig, key realityPostHandshakeKey) (lens []uint16, ok bool) {
+	e := c.start(config, key)
+	select {
+	case <-e.done:
+	default:
+		wait := time.Until(e.started.Add(realityPostHandshakeWait))
+		if wait <= 0 {
+			return nil, false
+		}
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-e.done:
+		case <-timer.C:
+			return nil, false
+		}
+	}
+	if !e.ok {
+		return nil, false
+	}
+	return e.lens, true
+}
+
+// warmPostHandshake learns, once for a config and its clones, the patterns of
+// the handshakes clients usually make: each server name with h2 and each
+// TLS 1.3 cipher suite. It is called on every connection and returns at once;
+// the probes run one after another in the background, so the first client
+// after a start finds its pattern learned and neither waits for it nor differs
+// from the clients after it.
+func (a *RealityConfig) warmPostHandshake() {
+	if a.noPostHandshakeWarm {
+		return
+	}
+	c := a.postHandshakeCache()
+	c.mu.Lock()
+	warmed := c.warmed
+	c.warmed = true
+	c.mu.Unlock()
+	if warmed {
+		return
+	}
+	names := make([]string, 0, realityWarmServerNames)
+	for name, on := range a.ServerNames {
+		if on && name != "" && len(names) < realityWarmServerNames {
+			names = append(names, name)
+		}
+	}
+	go func() {
+		for _, name := range names {
+			for _, suite := range []uint16{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256} {
+				<-c.start(a, realityPostHandshakeKey{network: a.Type, dest: a.Dest, serverName: name, alpn: realityALPNH2, cipherSuite: suite}).done
+			}
+		}
+	}()
 }
 
 func (e *realityPostHandshakeEntry) run(config *RealityConfig, key realityPostHandshakeKey) {
@@ -188,6 +268,7 @@ func realityProbePostHandshakeRecords(config *RealityConfig, key realityPostHand
 	ctx, cancel := context.WithTimeout(context.Background(), realityPostHandshakeProbeTimeout)
 	defer cancel()
 
+	began := time.Now()
 	target, err := config.DialContext(ctx, key.network, key.dest)
 	if err != nil {
 		return nil, err
@@ -204,6 +285,12 @@ func realityProbePostHandshakeRecords(config *RealityConfig, key realityPostHand
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		return nil, err
 	}
+	// The target answers within about a round trip, and the dial and the
+	// handshake just took several: a target farther away gets longer.
+	quiet := realityPostHandshakeQuiet
+	if took := time.Since(began); took > quiet {
+		quiet = took
+	}
 	if state := uconn.ConnectionState(); state.Version != VersionTLS13 || state.CipherSuite != key.cipherSuite {
 		return nil, errors.New("REALITY: probe negotiated unexpected parameters")
 	}
@@ -214,14 +301,20 @@ func realityProbePostHandshakeRecords(config *RealityConfig, key realityPostHand
 	data := append([]byte(nil), uconn.rawInput.Bytes()...)
 
 	// Bound the collection: a read deadline where supported, and a hard close
-	// for transports that ignore deadlines.
+	// for transports that ignore deadlines. It ends when the target hangs up,
+	// when it has been quiet for long enough, or at the end of the window.
 	stop := time.AfterFunc(realityPostHandshakeCollectWindow, func() { target.Close() })
 	defer stop.Stop()
-	target.SetReadDeadline(time.Now().Add(realityPostHandshakeCollectWindow))
+	end := time.Now().Add(realityPostHandshakeCollectWindow)
 
 	const maxCollect = (realityMaxPostHandshakeRecords + 1) * realityMaxPostHandshakeRecordLen
 	buf := make([]byte, 4096)
 	for len(data) <= maxCollect {
+		deadline := time.Now().Add(quiet)
+		if deadline.After(end) {
+			deadline = end
+		}
+		target.SetReadDeadline(deadline)
 		n, err := target.Read(buf)
 		data = append(data, buf[:n]...)
 		if err != nil {
@@ -313,20 +406,25 @@ func (a *RealityConfig) postHandshakeCache() *realityPostHandshakeCache {
 	return a.postHandshake.Load()
 }
 
+// postHandshakeKey is the key of the pattern this handshake has to imitate.
+// It is known once the target's ServerHello was read.
+func (hs *realityServerHandshakeStateTLS13) postHandshakeKey() realityPostHandshakeKey {
+	return realityPostHandshakeKey{
+		network:     hs.Config.Type,
+		dest:        hs.Config.Dest,
+		serverName:  hs.clientHello.serverName,
+		alpn:        realityALPNMode(hs.clientHello.alpnProtocols),
+		cipherSuite: hs.hello.cipherSuite,
+	}
+}
+
 // imitatePostHandshakeRecords is called after the client's Finished was
 // verified. It replays the target's learned post-handshake records, minus the
 // ones already mirrored in the first flight. Without a usable cache entry it
 // changes nothing.
 func (hs *realityServerHandshakeStateTLS13) imitatePostHandshakeRecords() error {
 	config := hs.Config
-	key := realityPostHandshakeKey{
-		network:     config.Type,
-		dest:        config.Dest,
-		serverName:  hs.clientHello.serverName,
-		alpn:        realityALPNMode(hs.clientHello.alpnProtocols),
-		cipherSuite: hs.hello.cipherSuite,
-	}
-	lens, ok := config.postHandshakeCache().lookup(config, key)
+	lens, ok := config.postHandshakeCache().lookup(config, hs.postHandshakeKey())
 	if !ok {
 		return nil
 	}

@@ -143,6 +143,14 @@ type RealityConfig struct {
 	// not probe the target again.
 	postHandshake atomic.Pointer[realityPostHandshakeCache]
 
+	// replay remembers the ClientHellos already accepted (reality_replay.go).
+	// It is created lazily and shared with clones.
+	replay atomic.Pointer[realityReplayGuard]
+
+	// noPostHandshakeWarm keeps the post-handshake patterns from being learned
+	// ahead of the first client. Tests that count the target's connections set it.
+	noPostHandshakeWarm bool
+
 	// mldsa65 caches the private key expanded from Mldsa65Seed.
 	mldsa65 atomic.Pointer[realityMldsa65Key]
 	ecdhKey atomic.Pointer[realityECDHKey]
@@ -166,9 +174,11 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		HandshakeTimeout:      a.HandshakeTimeout,
 		Mldsa65Seed:           a.Mldsa65Seed,
 		RequireX25519MLKEM768: a.RequireX25519MLKEM768,
+		noPostHandshakeWarm:   a.noPostHandshakeWarm,
 		Config:                *a.Config.Clone(),
 	}
 	c.postHandshake.Store(a.postHandshakeCache())
+	c.replay.Store(a.replayGuard())
 	c.ecdhKey.Store(a.ecdhKey.Load())
 	return c
 }
@@ -416,6 +426,8 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		config.Log("REALITY remoteAddr: %v", remoteAddr)
 	}
 
+	config.warmPostHandshake()
+
 	target, err := config.DialContext(ctx, config.Type, config.Dest)
 	if err != nil {
 		conn.Close()
@@ -497,7 +509,15 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 					(config.MaxClientVer == nil || realityValue(hs.ClientVer[:]...) <= realityValue(config.MaxClientVer...)) &&
 					(config.MaxTimeDiff == 0 || config.time().Sub(hs.ClientTime).Abs() <= config.MaxTimeDiff) &&
 					(config.ShortIds[hs.ClientShortId]) {
-					hs.c.conn = conn
+					// A second copy of an accepted ClientHello is a recording sent
+					// again: it goes to the target, as a stranger's does.
+					if config.replayGuard().seen(hs.clientHello.random, config.time(), config.replayWindow()) {
+						if config.Log != nil {
+							config.Log("REALITY remoteAddr: %v replayed ClientHello", remoteAddr)
+						}
+					} else {
+						hs.c.conn = conn
+					}
 				}
 				break
 			}
@@ -603,6 +623,10 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				s2cSaved = s2cSaved[handshakeLen:]
 				handshakeLen = 0
 			}
+			// The target's answer names the cipher suite: the pattern of its
+			// post-handshake records can be asked for now, while the client's
+			// Finished is still on its way.
+			config.postHandshakeCache().start(config, hs.postHandshakeKey())
 			start := time.Now()
 			err = hs.handshake()
 			if config.Log != nil {

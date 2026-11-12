@@ -26,6 +26,8 @@ func init() {
 	// probe goroutine can race with a later test changing them.
 	realityPostHandshakeCollectWindow = 500 * time.Millisecond
 	realityPostHandshakeProbeTimeout = 2 * time.Second
+	realityPostHandshakeQuiet = 150 * time.Millisecond
+	realityPostHandshakeWait = time.Second
 }
 
 const realityTestServerName = "example.golang"
@@ -121,6 +123,9 @@ func newRealityTestConfig(t *testing.T, dest string) (*RealityConfig, *ecdh.Publ
 		ServerNames: map[string]bool{realityTestServerName: true},
 		PrivateKey:  priv,
 		ShortIds:    map[[8]byte]bool{realityTestShortID: true},
+		// The tests count the target's connections and the probes: each learns
+		// its pattern on demand. TestRealityPostHandshakeWarm turns it back on.
+		noPostHandshakeWarm: true,
 	}
 	config.SessionTicketsDisabled = true
 	return config, pubKey
@@ -365,9 +370,9 @@ func toUint16s(lens []int) []uint16 {
 }
 
 // Scenario A and B: the target sends records only after it received the
-// client's Finished. The first REALITY connection (nothing learned yet) shows
-// the mismatch; once the probe finished the REALITY server reproduces the
-// target's record lengths.
+// client's Finished. The first REALITY connection (nothing learned yet) waits
+// for the probe and reproduces the target's record lengths as every later one
+// does.
 func TestRealityPostHandshakeRecordsImitated(t *testing.T) {
 	tt := newRealityTestTarget(t, realityTestTargetConfig(nil, false), map[string][]int{"": {300, 150}}, true)
 	config, pub := newRealityTestConfig(t, tt.addr())
@@ -379,8 +384,8 @@ func TestRealityPostHandshakeRecordsImitated(t *testing.T) {
 	}
 
 	got, suite := realityTestConnect(t, addr, pub, nil, realityTestSuites)
-	if len(got) != 0 {
-		t.Fatalf("cold connection records = %v, want none (nothing learned yet)", got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cold connection records = %v, want %v: the first client must not differ from the next", got, want)
 	}
 
 	e := realityTestWaitProbe(t, config, realityTestKey(config, nil, suite))
@@ -462,8 +467,8 @@ func TestRealityPostHandshakeALPN(t *testing.T) {
 		want := realityTestObserveTarget(t, tt, tc.alpn, realityTestSuites)
 		learned[tc.name] = want
 		got, suite := realityTestConnect(t, addr, pub, tc.alpn, realityTestSuites)
-		if len(got) != 0 {
-			t.Fatalf("%s: cold connection records = %v, want none", tc.name, got)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: cold connection records = %v, want %v", tc.name, got, want)
 		}
 		e := realityTestWaitProbe(t, config, realityTestKey(config, tc.alpn, suite))
 		if !e.ok || !reflect.DeepEqual(e.lens, toUint16s(want)) {
@@ -816,4 +821,103 @@ func (c *countingWriter) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	c.n += n
 	return n, err
+}
+
+// The patterns of the usual handshakes are learned ahead, on the first
+// connection of any kind: a stranger's is enough. The first client then finds
+// its pattern learned, gets the target's records at once and causes no probe.
+func TestRealityPostHandshakeWarm(t *testing.T) {
+	alpn := []string{"h2", "http/1.1"}
+	tt := newRealityTestTarget(t, realityTestTargetConfig(alpn, false), map[string][]int{"h2": {300, 400}}, true)
+	config, pub := newRealityTestConfig(t, tt.addr())
+	config.noPostHandshakeWarm = false
+	addr := newRealityTestServer(t, config)
+
+	stranger, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger.Close()
+
+	cache := config.postHandshakeCache()
+	for _, suite := range realityTestSuites {
+		key := realityTestKey(config, alpn, suite)
+		var e *realityPostHandshakeEntry
+		for deadline := time.Now().Add(10 * time.Second); e == nil; {
+			cache.mu.Lock()
+			e = cache.entries[key]
+			cache.mu.Unlock()
+			if e == nil {
+				if time.Now().After(deadline) {
+					t.Fatalf("suite %x was not learned ahead", suite)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		select {
+		case <-e.done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("suite %x: the probe did not finish", suite)
+		}
+		if !e.ok || len(e.lens) != 2 {
+			t.Fatalf("suite %x: ok=%v lens=%v, want the two records of h2", suite, e.ok, e.lens)
+		}
+	}
+	if n := realityTestCacheSize(config); n != len(realityTestSuites) {
+		t.Fatalf("cache holds %d entries, want one per cipher suite", n)
+	}
+	probes := tt.completed.Load()
+	if probes != int32(len(realityTestSuites)) {
+		t.Fatalf("target completed %d handshakes, want one probe per cipher suite", probes)
+	}
+
+	want := realityTestObserveTarget(t, tt, alpn, realityTestSuites)
+	began := time.Now()
+	got, _ := realityTestConnect(t, addr, pub, alpn, realityTestSuites)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("the first client's records = %v, want %v", got, want)
+	}
+	if took := time.Since(began); took > realityPostHandshakeWait/2 {
+		t.Fatalf("the first client took %v: it waited for a pattern that was learned ahead", took)
+	}
+	if n := tt.completed.Load(); n != probes+1 { // the observation alone
+		t.Fatalf("target completed %d handshakes, want %d: the client caused a probe", n, probes+1)
+	}
+	// A second config's clone does not learn again.
+	config.Clone().warmPostHandshake()
+	time.Sleep(50 * time.Millisecond)
+	if n := tt.completed.Load(); n != probes+1 {
+		t.Fatalf("a clone learned the patterns again: %d handshakes", n)
+	}
+}
+
+// A client waits for a pattern that is being learned only for a bounded time,
+// counted from the start of the probe: a probe that hangs holds up the clients
+// of its first moments and none after them.
+func TestRealityPostHandshakeWaitIsBounded(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	targetConfig := realityTestTargetConfig(nil, false)
+	targetConfig.GetConfigForClient = func(chi *ClientHelloInfo) (*Config, error) {
+		if len(chi.CipherSuites) == 1 { // only the probe pins a single suite
+			<-release
+			return nil, errors.New("probe rejected")
+		}
+		return nil, nil
+	}
+	tt := newRealityTestTarget(t, targetConfig, nil, true)
+	config, pub := newRealityTestConfig(t, tt.addr())
+	addr := newRealityTestServer(t, config)
+
+	began := time.Now()
+	realityTestConnect(t, addr, pub, nil, realityTestSuites)
+	first := time.Since(began)
+	if first < realityPostHandshakeWait/2 || first > realityPostHandshakeWait+time.Second {
+		t.Fatalf("the first client took %v, want about %v", first, realityPostHandshakeWait)
+	}
+	began = time.Now()
+	realityTestConnect(t, addr, pub, nil, realityTestSuites)
+	if next := time.Since(began); next > realityPostHandshakeWait/2 {
+		t.Fatalf("a later client took %v: it waited for the hanging probe again", next)
+	}
 }
